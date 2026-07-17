@@ -53,3 +53,8 @@ The architecture diagram from the project report will be added here.
 ## Project Status
 
 This project is currently under development as a prototype for an AI-based flood risk prediction system in South Australia.
+
+## Data & Licensing
+Rainfall and river level data sourced from the Bureau of Meteorology (BoM)
+and the Murray-Darling Basin Authority (MDBA), © Commonwealth of Australia,
+licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).
