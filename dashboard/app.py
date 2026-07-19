@@ -13,41 +13,30 @@ BAND_HEX = {"Low": "#12a150", "Moderate": "#e0982b", "High": "#d64545"}
 
 STATION = {"name": "Murray Bridge", "id": "A4261162", "lat": -35.12, "lon": 139.27}
 DEFAULT_LEVELS = [0.67, 0.65, 0.65, 0.67, 0.69, 0.69, 0.73]
-LEVEL_FEATURES = ["level_lag1", "level_lag2", "level_roll7", "level_change3"]
+FEATURES = ["level_lag1", "level_lag2", "level_roll7", "level_change3"]
 
 
 @st.cache_resource
 def load_models():
     import joblib
-    root = Path(__file__).resolve().parent.parent
+    nb = Path(__file__).resolve().parent.parent / "notebooks"
     models = {}
-
-    rf_path = root / "models" / "Random_Forest.joblib"
-    if rf_path.exists():
-        b = joblib.load(rf_path)
-        models["Random Forest"] = (b["model"], list(b["features"]))
-
-    lr_path = root / "notebooks" / "logistic_regression_real.joblib"
-    if lr_path.exists():
-        m = joblib.load(lr_path)
-        feats = list(getattr(m, "feature_names_in_", LEVEL_FEATURES))
-        models["Logistic Regression"] = (m, feats)
-
+    for name, fname in [("Random Forest", "Random_Forest.joblib"),
+                        ("Logistic Regression", "logistic_regression_real.joblib")]:
+        path = nb / fname
+        if path.exists():
+            m = joblib.load(path)
+            models[name] = (m, list(getattr(m, "feature_names_in_", FEATURES)))
     return models
 
 
-def all_features(levels, rainfall):
+def features_from_levels(levels):
     window = levels[-7:]
     return {
         "level_lag1": levels[-1],
         "level_lag2": levels[-2],
         "level_roll7": sum(window) / len(window),
         "level_change3": levels[-1] - levels[-4],
-        "rain_lag1": rainfall[-1] if rainfall else 0.0,
-        "rain_roll3": float(sum(rainfall[-3:])),
-        "rain_roll7": float(sum(rainfall[-7:])),
-        "rain_roll14": float(sum(rainfall[-14:])),
-        "rain_roll30": float(sum(rainfall[-30:])),
     }
 
 
@@ -61,15 +50,13 @@ st.caption("Next-day flood risk (high river level) for Murray Bridge. Advisory o
 
 models = load_models()
 if not models:
-    st.error("No model found. Run the Random Forest notebook to create models/flood_model.joblib.")
+    st.error("No model found. Run the Random Forest notebook to create notebooks/Random_Forest.joblib.")
     st.stop()
 
 with st.sidebar:
     st.header("Model")
     choice = st.selectbox("Choose a model", list(models.keys()))
     model, feature_order = models[choice]
-    uses_rain = any(f.startswith("rain") for f in feature_order)
-    st.caption(f"{choice} uses {len(feature_order)} features.")
 
     st.header("Recent river levels (m)")
     levels = []
@@ -78,15 +65,7 @@ with st.sidebar:
     shift = st.slider("Shift whole series (m)", -0.5, 2.0, 0.0, 0.05)
     levels = [round(x + shift, 3) for x in levels]
 
-    rainfall = [0.0] * 30
-    if uses_rain:
-        st.header("Recent rainfall (mm)")
-        rain_intensity = st.slider("Daily rainfall (mm/day)", 0.0, 60.0, 2.0, 0.5)
-        rain_days = st.slider("Number of recent rainy days", 0, 14, 2, 1)
-        for k in range(1, rain_days + 1):
-            rainfall[-k] = rain_intensity
-
-feats = all_features(levels, rainfall)
+feats = features_from_levels(levels)
 row = pd.DataFrame([[feats[c] for c in feature_order]], columns=feature_order)
 prob = float(model.predict_proba(row)[0][1])
 band = band_of(prob)
@@ -101,7 +80,7 @@ with col1:
         f"background:{BAND_HEX[band]};font-weight:600;display:inline-block'>Risk band: {band}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(f"Model: {choice} ({len(feature_order)} features)")
+    st.caption(f"Model: {choice}")
     if band == "High":
         st.error("High risk. Would require operator review before any alert is sent.")
     st.markdown("**Model features (derived)**")
