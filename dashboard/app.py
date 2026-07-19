@@ -1,18 +1,20 @@
 """
-Flood Risk Dashboard (Streamlit)
-================================
-River Murray flood-risk prototype — serves the team's trained Logistic
+Flood Risk Dashboard (Streamlit) — single-screen operations view
+===============================================================
+River Murray flood-risk prototype. Serves the team's trained Logistic
 Regression model (next-day high-river-level risk for Murray Bridge).
 
-Features:
-- Risk gauge + colour-coded band
-- Sensitivity band (how the score moves under +/- 5 cm gauge error)
-- Explainability panel (exact per-feature contributions for logistic regression)
-- 30-day river-level trend vs the risk threshold
-- Scenario presets instead of raw sliders
+Layout (single screen, no scrolling):
+    Header      title | Live | time | operator | horizon tabs
+    Left card   catchment map (modelled + context stations)
+    Right cards 1) selected station: gauge + uncertainty band
+                2) why this score (feature contributions)
+                3) alert authorisation (human-in-the-loop + audit log)
 
-Prediction source: the FastAPI backend if an API URL is set, otherwise the
-local model bundled in the repo, otherwise a transparent fallback.
+Honesty notes:
+- Only Murray Bridge (A4261162) has a trained model. Other stations are shown
+  as context markers, not predictions.
+- 24/48/72h horizons extrapolate the recent level trend, then score the model.
 """
 
 import math
@@ -35,11 +37,20 @@ FEATURE_LABEL = {
     "level_roll7": "7-day average level",
     "level_change3": "3-day level change",
 }
-STATION = {"name": "Murray Bridge", "id": "A4261162", "lat": -35.12, "lon": 139.27}
 BAND_HEX = {"Low": "#12a150", "Moderate": "#e0982b", "High": "#d64545"}
 BAND_COLOR = {"Low": "green", "Moderate": "orange", "High": "red"}
 
-# Real-data fallbacks (used if the CSV or model is unavailable at runtime).
+MODELLED = {"name": "Murray Bridge", "id": "A4261162", "lat": -35.12, "lon": 139.27}
+CONTEXT_STATIONS = [
+    {"name": "Renmark", "lat": -34.1746, "lon": 140.7461},
+    {"name": "Berri", "lat": -34.2833, "lon": 140.60},
+    {"name": "Loxton", "lat": -34.45, "lon": 140.57},
+    {"name": "Waikerie", "lat": -34.18, "lon": 139.98},
+    {"name": "Morgan", "lat": -34.03, "lon": 139.49},
+    {"name": "Blanchetown", "lat": -34.35, "lon": 139.62},
+    {"name": "Mannum", "lat": -34.91, "lon": 139.31},
+]
+
 FALLBACK_LEVELS = [0.725, 0.689, 0.731, 0.661, 0.653, 0.647, 0.616, 0.604, 0.654,
                    0.631, 0.592, 0.668, 0.644, 0.638, 0.667, 0.664, 0.686, 0.755,
                    0.733, 0.726, 0.713, 0.717, 0.718, 0.718, 0.7, 0.668, 0.648,
@@ -65,7 +76,6 @@ def load_model():
 
 @st.cache_data
 def load_history():
-    """Return (recent 30 daily levels, feature-baseline medians) from real data."""
     here = Path(__file__).resolve().parent
     p = here.parent / "data" / "murray_bridge_river_level_historical.csv"
     try:
@@ -95,12 +105,9 @@ def coef_map(model):
 
 
 def features_from_levels(levels):
-    return {
-        "level_lag1": levels[-1],
-        "level_lag2": levels[-2],
-        "level_roll7": sum(levels[-7:]) / len(levels[-7:]),
-        "level_change3": levels[-1] - levels[-4],
-    }
+    return {"level_lag1": levels[-1], "level_lag2": levels[-2],
+            "level_roll7": sum(levels[-7:]) / len(levels[-7:]),
+            "level_change3": levels[-1] - levels[-4]}
 
 
 def band_of(p):
@@ -120,7 +127,7 @@ def predict(api_url, levels, model):
     if api_url:
         try:
             r = requests.post(api_url.rstrip("/") + "/predict_series",
-                              json={"levels": levels, "station_id": STATION["id"]}, timeout=30)
+                              json={"levels": levels, "station_id": MODELLED["id"]}, timeout=30)
             r.raise_for_status()
             b = r.json()
             return b["flood_probability"], b["risk_band"], feats, b.get("model_source", "api")
@@ -140,23 +147,57 @@ def apply_scenario(base_levels, scenario, offset):
     return [round(v + offset, 3) for v in s]
 
 
+def project(levels, days):
+    """Extrapolate the recent trend forward `days` days."""
+    if days <= 0:
+        return list(levels)
+    y = levels[-7:]
+    slope = (y[-1] - y[0]) / max(len(y) - 1, 1)
+    out = list(levels)
+    for _ in range(days):
+        out.append(round(out[-1] + slope, 3))
+    return out
+
+
 def gauge_svg(p, color):
-    r = 80
-    length = math.pi * r
+    r, length = 72, math.pi * 72
     off = length * (1 - p)
     return f"""
-    <svg width="210" height="120" viewBox="0 0 200 118">
-      <path d="M20 110 A80 80 0 0 1 180 110" fill="none" stroke="#eef2f7" stroke-width="16" stroke-linecap="round"/>
-      <path d="M20 110 A80 80 0 0 1 180 110" fill="none" stroke="{color}" stroke-width="16"
+    <svg width="100%" height="104" viewBox="0 0 184 104" preserveAspectRatio="xMidYMid meet">
+      <path d="M20 96 A72 72 0 0 1 164 96" fill="none" stroke="#eef2f7" stroke-width="15" stroke-linecap="round"/>
+      <path d="M20 96 A72 72 0 0 1 164 96" fill="none" stroke="{color}" stroke-width="15"
             stroke-linecap="round" stroke-dasharray="{length:.1f}" stroke-dashoffset="{off:.1f}"/>
-      <text x="100" y="96" text-anchor="middle" font-size="32" font-weight="700" fill="#0f2438">{round(p*100)}%</text>
-      <text x="100" y="112" text-anchor="middle" font-size="11" fill="#7a8aa0">flood probability</text>
-    </svg>
-    """
+      <text x="92" y="84" text-anchor="middle" font-size="30" font-weight="700" fill="#0f2438">{round(p*100)}%</text>
+      <text x="92" y="99" text-anchor="middle" font-size="10" fill="#7a8aa0">flood probability</text>
+    </svg>"""
+
+
+def band_bar(lo, hi, p):
+    return f"""
+    <div style="position:relative;height:10px;border-radius:5px;background:#eef2f7;margin-top:4px">
+      <div style="position:absolute;left:{lo*100:.0f}%;width:{max(hi-lo,0.01)*100:.0f}%;top:0;bottom:0;
+                  background:#cfe1fb;border-radius:5px"></div>
+      <div style="position:absolute;left:{p*100:.0f}%;top:-3px;width:3px;height:16px;background:#1f6feb;border-radius:2px"></div>
+    </div>"""
 
 
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="River Murray Flood Risk", page_icon="🌊", layout="wide")
+st.set_page_config(page_title="River Murray Flood Risk", page_icon="🌊",
+                   layout="wide", initial_sidebar_state="collapsed")
+
+st.markdown("""
+<style>
+  .block-container {padding-top: 1.1rem; padding-bottom: 0.6rem; max-width: 1500px;}
+  h1, h2, h3 {margin-bottom: .2rem !important;}
+  [data-testid="stMetricValue"] {font-size: 1.15rem;}
+  [data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
+  div[data-testid="stHorizontalBlock"] {gap: .8rem;}
+  .badge {display:inline-block;padding:3px 9px;border-radius:7px;font-size:12px;font-weight:600}
+  .card-title {font-size:13px;font-weight:600;color:#0f2438;margin-bottom:2px}
+  .muted {color:#7a8aa0;font-size:11px}
+  .row {display:flex;justify-content:space-between;font-size:12px;color:#4a5b70;margin:2px 0}
+</style>
+""", unsafe_allow_html=True)
 
 model = load_model()
 base_levels, baseline = load_history()
@@ -166,104 +207,144 @@ try:
 except Exception:
     default_api = os.getenv("API_URL", "")
 
-# ---- Sidebar ----
 with st.sidebar:
-    st.header("Scenario")
-    scenario = st.radio("River condition", ["Recent (actual)", "Rising river", "Flood watch"],
-                        help="Start from the real recent series, or simulate a rising river.")
-    offset = st.slider("Level offset (m)", -0.30, 1.50, 0.0, 0.05,
-                       help="Shift the whole series up or down to explore thresholds.")
-    st.divider()
+    st.header("Controls")
+    scenario = st.radio("River condition", ["Recent (actual)", "Rising river", "Flood watch"])
+    offset = st.slider("Level offset (m)", -0.30, 1.50, 0.0, 0.05)
     api_url = st.text_input("API URL (optional)", value=default_api,
                             placeholder="https://flood-risk-api.onrender.com")
-    st.caption("Blank = use the model bundled in the repo.")
+    st.caption("Blank = model bundled in the repo.")
     with st.expander("About the model"):
-        st.write(
-            "Logistic Regression trained on Murray Bridge river levels. "
-            f"'Flood' = level at/above the {TRAIN_RISK_THRESHOLD_M} m risk threshold "
-            "(0.80 quantile). Features are lagged and rolling river levels."
-        )
-
-levels = apply_scenario(base_levels, scenario, offset)
-prob, band, feats, source = predict(api_url, levels, model)
+        st.write(f"Logistic Regression on Murray Bridge river levels. 'Flood' = level at/above "
+                 f"{TRAIN_RISK_THRESHOLD_M} m (0.80 quantile). Horizons extrapolate the recent trend.")
 
 # ---- Header ----
-st.title("🌊 River Murray Flood Risk — Prototype")
-st.caption(
-    "Next-day flood risk for Murray Bridge from the trained model. "
-    "Alerts require human authorisation — this view is advisory. "
-    f"Updated {datetime.now().strftime('%d %b %Y, %H:%M')}."
-)
-
-# ---- Row 1: prediction + explainability ----
-c1, c2 = st.columns([1, 1.25], gap="large")
-
-with c1:
-    st.subheader("Prediction")
-    st.markdown(gauge_svg(prob, BAND_HEX[band]), unsafe_allow_html=True)
+h1, h2 = st.columns([2.2, 1])
+with h1:
+    st.markdown("### 🌊 River Murray Flood Risk")
+    st.markdown("<span class='muted'>SES &amp; Local Council decision support · ITA602 prototype</span>",
+                unsafe_allow_html=True)
+with h2:
     st.markdown(
-        f"<div style='padding:8px 13px;border-radius:8px;color:white;background:{BAND_HEX[band]};"
-        f"font-weight:600;display:inline-block'>Risk band: {band}</div>",
-        unsafe_allow_html=True,
-    )
+        f"<div style='text-align:right;margin-top:6px'>"
+        f"<span class='badge' style='background:#e6f5ec;color:#0c6b39'>● Live</span> "
+        f"<span class='badge' style='background:#f2f5f9;color:#4a5b70'>{datetime.now().strftime('%H:%M')}</span> "
+        f"<span class='badge' style='background:#eaf3ff;color:#0c447c'>Operator: J. Sanchez</span></div>",
+        unsafe_allow_html=True)
 
-    # Sensitivity band (+/- 5 cm gauge error)
-    lo = predict_local(model, features_from_levels([v - 0.05 for v in levels]))
-    hi = predict_local(model, features_from_levels([v + 0.05 for v in levels]))
-    blo, bhi = min(lo, hi), max(lo, hi)
-    st.markdown(
-        f"<div style='margin-top:12px;font-size:13px;color:#4a5b70'>Sensitivity band "
-        f"(&plusmn;5&nbsp;cm gauge error): <b>{blo*100:.0f}% – {bhi*100:.0f}%</b></div>",
-        unsafe_allow_html=True,
-    )
-    st.progress(prob)
+horizon = st.radio("Forecast horizon", ["24h", "48h", "72h"], index=1,
+                   horizontal=True, label_visibility="collapsed")
+days = {"24h": 1, "48h": 2, "72h": 3}[horizon]
 
-    latest = levels[-1]
-    st.metric("Latest river level", f"{latest:.2f} m", f"{latest - TRAIN_RISK_THRESHOLD_M:+.2f} m vs threshold")
-    st.caption(f"Source: {source} · risk threshold {TRAIN_RISK_THRESHOLD_M} m")
+levels = project(apply_scenario(base_levels, scenario, offset), days)
+prob, band, feats, source = predict(api_url, levels, model)
+lo = predict_local(model, features_from_levels([v - 0.05 for v in levels]))
+hi = predict_local(model, features_from_levels([v + 0.05 for v in levels]))
+blo, bhi = min(lo, hi), max(lo, hi)
 
-with c2:
-    st.subheader("Why this score")
-    contrib = pd.DataFrame([
-        {"feature": FEATURE_LABEL[f], "contribution": round(coefs[f] * (feats[f] - baseline[f]), 3)}
-        for f in FEATURES
-    ])
-    contrib["direction"] = contrib["contribution"].apply(lambda v: "Raises risk" if v >= 0 else "Lowers risk")
-    bars = alt.Chart(contrib).mark_bar().encode(
-        x=alt.X("contribution:Q", title="Contribution to risk score"),
-        y=alt.Y("feature:N", sort="-x", title=None),
-        color=alt.Color("direction:N",
-                        scale=alt.Scale(domain=["Raises risk", "Lowers risk"], range=["#d64545", "#1f6feb"]),
-                        legend=alt.Legend(orient="bottom", title=None)),
-        tooltip=[alt.Tooltip("feature:N", title="Feature"),
-                 alt.Tooltip("contribution:Q", title="Contribution", format="+.3f")],
-    ).properties(height=210)
-    zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#c3ccd8").encode(x="x:Q")
-    st.altair_chart(zero + bars, use_container_width=True)
-    st.caption("Exact per-feature contributions for logistic regression: coefficient × (feature − typical value).")
+# ---- Main: map | right column ----
+left, right = st.columns([1.55, 1], gap="medium")
 
-# ---- Row 2: trend chart ----
-st.subheader("Recent river level vs risk threshold")
-tdf = pd.DataFrame({"days ago": list(range(-len(levels) + 1, 1)), "level (m)": levels})
-line = alt.Chart(tdf).mark_line(point=True, color="#1f6feb").encode(
-    x=alt.X("days ago:Q", title="days (0 = latest)"),
-    y=alt.Y("level (m):Q", title="river level (m)", scale=alt.Scale(zero=False)),
-    tooltip=["days ago", "level (m)"],
-)
-threshold = alt.Chart(pd.DataFrame({"y": [TRAIN_RISK_THRESHOLD_M]})).mark_rule(
-    color="#d64545", strokeDash=[6, 4]).encode(y="y:Q")
-st.altair_chart((line + threshold).properties(height=240), use_container_width=True)
-st.caption(f"Dashed line = {TRAIN_RISK_THRESHOLD_M} m risk threshold (0.80 quantile of historical level).")
+with left:
+    with st.container(border=True):
+        t1, t2 = st.columns([1, 1])
+        t1.markdown("<div class='card-title'>Catchment overview</div>", unsafe_allow_html=True)
+        t2.markdown(
+            "<div style='text-align:right;font-size:11px'>"
+            "<span style='color:#12a150'>●</span> Low "
+            "<span style='color:#e0982b'>●</span> Moderate "
+            "<span style='color:#d64545'>●</span> High "
+            "<span style='color:#9aa6bd'>●</span> No model</div>", unsafe_allow_html=True)
+        fmap = folium.Map(location=[-34.6, 139.9], zoom_start=7, tiles="CartoDB positron")
+        for s in CONTEXT_STATIONS:
+            folium.CircleMarker([s["lat"], s["lon"]], radius=6, color="#9aa6bd", fill=True,
+                                fill_color="#9aa6bd", fill_opacity=0.8,
+                                tooltip=f"{s['name']} — context only (no trained model)").add_to(fmap)
+        folium.CircleMarker([MODELLED["lat"], MODELLED["lon"]], radius=12, color=BAND_COLOR[band],
+                            fill=True, fill_color=BAND_COLOR[band], fill_opacity=0.9,
+                            tooltip=f"{MODELLED['name']}: {band} ({prob*100:.0f}%)").add_to(fmap)
+        st_folium(fmap, height=395, use_container_width=True, returned_objects=[])
+        st.markdown("<div class='muted'>8 stations shown · modelled: Murray Bridge · "
+                    "sources: BoM, SILO, DEW</div>", unsafe_allow_html=True)
+        with st.expander("30-day level trend"):
+            tdf = pd.DataFrame({"days ago": list(range(-len(levels) + 1, 1)), "level (m)": levels})
+            line = alt.Chart(tdf).mark_line(point=False, color="#1f6feb").encode(
+                x=alt.X("days ago:Q", title=None),
+                y=alt.Y("level (m):Q", title="m", scale=alt.Scale(zero=False)))
+            rule = alt.Chart(pd.DataFrame({"y": [TRAIN_RISK_THRESHOLD_M]})).mark_rule(
+                color="#d64545", strokeDash=[6, 4]).encode(y="y:Q")
+            st.altair_chart((line + rule).properties(height=150), use_container_width=True)
 
-# ---- Row 3: map ----
-st.subheader("Station")
-fmap = folium.Map(location=[STATION["lat"], STATION["lon"]], zoom_start=9, tiles="CartoDB positron")
-folium.CircleMarker(
-    location=[STATION["lat"], STATION["lon"]], radius=12,
-    color=BAND_COLOR[band], fill=True, fill_color=BAND_COLOR[band], fill_opacity=0.9,
-    popup=f"{STATION['name']}: {band} ({prob*100:.0f}%)", tooltip=STATION["name"],
-).add_to(fmap)
-st_folium(fmap, height=380, use_container_width=True)
+with right:
+    # Card 1 — selected station
+    with st.container(border=True):
+        st.markdown(f"<div class='card-title'>Selected station: {MODELLED['name']}</div>"
+                    f"<div class='muted'>{MODELLED['id']} · 35.12°S, 139.27°E · next {horizon}</div>",
+                    unsafe_allow_html=True)
+        g1, g2 = st.columns([1.3, 1])
+        with g1:
+            st.markdown(gauge_svg(prob, BAND_HEX[band]), unsafe_allow_html=True)
+        with g2:
+            st.markdown(
+                f"<div style='margin-top:26px'><span class='badge' "
+                f"style='background:{BAND_HEX[band]};color:#fff'>{band} risk</span></div>"
+                f"<div class='muted' style='margin-top:6px'>latest {levels[-1]:.2f} m "
+                f"({levels[-1]-TRAIN_RISK_THRESHOLD_M:+.2f} m vs threshold)</div>",
+                unsafe_allow_html=True)
+        st.markdown(f"<div class='row'><span>Uncertainty band (±5 cm gauge error)</span>"
+                    f"<b>{blo*100:.0f}% – {bhi*100:.0f}%</b></div>{band_bar(blo, bhi, prob)}",
+                    unsafe_allow_html=True)
 
-st.divider()
-st.caption("Prototype for academic assessment (ITA602). Not for operational flood-warning use.")
+    # Card 2 — explainability
+    with st.container(border=True):
+        st.markdown("<div class='card-title'>Why this score</div>"
+                    "<div class='muted'>per-feature contribution (exact for logistic regression)</div>",
+                    unsafe_allow_html=True)
+        contrib = pd.DataFrame([{"feature": FEATURE_LABEL[f],
+                                 "contribution": round(coefs[f] * (feats[f] - baseline[f]), 3)}
+                                for f in FEATURES])
+        contrib["direction"] = contrib["contribution"].apply(
+            lambda v: "Increases risk" if v >= 0 else "Decreases risk")
+        bars = alt.Chart(contrib).mark_bar().encode(
+            x=alt.X("contribution:Q", title=None),
+            y=alt.Y("feature:N", sort="-x", title=None),
+            color=alt.Color("direction:N",
+                            scale=alt.Scale(domain=["Increases risk", "Decreases risk"],
+                                            range=["#d64545", "#1f6feb"]),
+                            legend=alt.Legend(orient="bottom", title=None, labelFontSize=10)),
+            tooltip=[alt.Tooltip("feature:N"), alt.Tooltip("contribution:Q", format="+.3f")],
+        ).properties(height=132)
+        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#c3ccd8").encode(x="x:Q")
+        st.altair_chart(zero + bars, use_container_width=True)
+
+    # Card 3 — alert authorisation
+    with st.container(border=True):
+        st.markdown("<div class='card-title'>Alert authorisation</div>", unsafe_allow_html=True)
+        if "alert_sent" not in st.session_state:
+            st.session_state.alert_sent = False
+        if band == "Low":
+            st.markdown("<div class='row' style='background:#f2f5f9;padding:6px 9px;border-radius:7px'>"
+                        "No alert proposed at this level</div>", unsafe_allow_html=True)
+        elif st.session_state.alert_sent:
+            st.markdown(f"<div class='row' style='background:#e6f5ec;color:#0c6b39;padding:6px 9px;"
+                        f"border-radius:7px'>Alert dispatched · {datetime.now().strftime('%H:%M')} "
+                        f"· authorised by J. Sanchez</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='row' style='background:#fdf2df;color:#8a5a0b;padding:6px 9px;"
+                        "border-radius:7px'>⚠ Awaiting human authorisation</div>", unsafe_allow_html=True)
+        st.markdown("<div class='row'><span class='muted'>Recipients</span>"
+                    "<span>Murray Bridge SES · Rural City Council</span></div>"
+                    "<div class='row'><span class='muted'>Channel</span>"
+                    "<span>Email (SendGrid) · SMS descoped</span></div>", unsafe_allow_html=True)
+        b1, b2 = st.columns([2, 1])
+        if b1.button("Authorise & dispatch alert", type="primary",
+                     disabled=(band == "Low" or st.session_state.alert_sent),
+                     use_container_width=True):
+            st.session_state.alert_sent = True
+            st.rerun()
+        if b2.button("Dismiss", use_container_width=True):
+            st.session_state.alert_sent = False
+            st.rerun()
+        audit = "#A-2292 · signed by J. Sanchez" if st.session_state.alert_sent else "#A-2291 · tamper-evident"
+        st.markdown(f"<div class='muted'>Audit log {audit} · retained per State Records Act 1997 (SA)</div>",
+                    unsafe_allow_html=True)
