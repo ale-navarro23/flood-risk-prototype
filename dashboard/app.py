@@ -22,7 +22,7 @@ def load_models():
     root = Path(__file__).resolve().parent.parent
     models = {}
 
-    rf_path = root / "models" / "flood_model.joblib"
+    rf_path = root / "models" / "Random_Forest.joblib"
     if rf_path.exists():
         b = joblib.load(rf_path)
         models["Random Forest"] = (b["model"], list(b["features"]))
