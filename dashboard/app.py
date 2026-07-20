@@ -2,19 +2,23 @@
 Flood Risk Dashboard (Streamlit) — single-screen operations view
 ===============================================================
 River Murray flood-risk prototype. Serves the team's trained Logistic
-Regression model (next-day high-river-level risk for Murray Bridge).
+Regression and Random Forest models (next-day high-river-level risk for
+Murray Bridge).
 
 Layout (single screen, no scrolling):
     Header      title | Live | time | operator | horizon tabs
     Left card   catchment map (modelled + context stations)
     Right cards 1) selected station: gauge + uncertainty band
-                2) why this score (feature contributions)
+                2) why this score (feature contributions / importance)
                 3) alert authorisation (human-in-the-loop + audit log)
 
 Honesty notes:
 - Only Murray Bridge (A4261162) has a trained model. Other stations are shown
   as context markers, not predictions.
 - 24/48/72h horizons extrapolate the recent level trend, then score the model.
+- Two models are available: Logistic Regression (Manuela) and Random Forest
+  (Ghale). Card 2 adapts automatically: signed feature contributions for the
+  Logistic Regression, feature importance for the Random Forest.
 """
 
 import math
@@ -59,19 +63,37 @@ FALLBACK_BASELINE = {"level_lag1": 0.693, "level_lag2": 0.693, "level_roll7": 0.
 FALLBACK_COEF = {"level_lag1": 13.095, "level_lag2": 3.991, "level_roll7": 9.148, "level_change3": 1.235}
 FALLBACK_INTERCEPT = -20.165
 
+# Where to look for each model, in order of preference. The app only offers
+# the models it actually finds, so nothing breaks if a file is missing.
+MODEL_FILES = {
+    "Logistic Regression": [
+        "backend/models/logistic_regression_real.joblib",
+        "notebooks/logistic_regression_real.joblib",
+    ],
+    "Random Forest": [
+        "notebooks/Random_Forest.joblib",
+        "models/best_model.joblib",
+    ],
+}
+
 
 @st.cache_resource
-def load_model():
+def load_models():
+    """Load every model we can find. Missing files are skipped, not fatal."""
     here = Path(__file__).resolve().parent
-    for p in [here.parent / "backend" / "models" / "logistic_regression_real.joblib",
-              here.parent / "notebooks" / "logistic_regression_real.joblib"]:
-        if p.exists():
-            try:
-                import joblib
-                return joblib.load(p)
-            except Exception:
-                pass
-    return None
+    repo = here.parent
+    models = {}
+    for name, candidates in MODEL_FILES.items():
+        for rel in candidates:
+            p = repo / rel
+            if p.exists():
+                try:
+                    import joblib
+                    models[name] = joblib.load(p)
+                    break
+                except Exception:
+                    pass
+    return models
 
 
 @st.cache_data
@@ -99,7 +121,7 @@ def load_history():
 
 
 def coef_map(model):
-    if model is not None:
+    if model is not None and hasattr(model, "coef_"):
         return {f: float(model.coef_[0][i]) for i, f in enumerate(FEATURES)}
     return FALLBACK_COEF
 
@@ -199,9 +221,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-model = load_model()
+models = load_models()
+if not models:
+    st.error("No trained model found in the repo. Make sure notebooks/logistic_regression_real.joblib "
+             "and/or notebooks/Random_Forest.joblib exist.")
+    st.stop()
+
 base_levels, baseline = load_history()
-coefs = coef_map(model)
 try:
     default_api = st.secrets.get("API_URL", os.getenv("API_URL", ""))
 except Exception:
@@ -209,14 +235,20 @@ except Exception:
 
 with st.sidebar:
     st.header("Controls")
+    model_choice = st.selectbox("Model", list(models.keys()), index=0)
+    model = models[model_choice]
     scenario = st.radio("River condition", ["Recent (actual)", "Rising river", "Flood watch"])
     offset = st.slider("Level offset (m)", -0.30, 1.50, 0.0, 0.05)
     api_url = st.text_input("API URL (optional)", value=default_api,
                             placeholder="https://flood-risk-api.onrender.com")
     st.caption("Blank = model bundled in the repo.")
     with st.expander("About the model"):
-        st.write(f"Logistic Regression on Murray Bridge river levels. 'Flood' = level at/above "
-                 f"{TRAIN_RISK_THRESHOLD_M} m (0.80 quantile). Horizons extrapolate the recent trend.")
+        if model_choice == "Logistic Regression":
+            st.write(f"Logistic Regression on Murray Bridge river levels. 'Flood' = level at/above "
+                     f"{TRAIN_RISK_THRESHOLD_M} m (0.80 quantile). Horizons extrapolate the recent trend.")
+        else:
+            st.write(f"Random Forest (400 trees) on Murray Bridge river levels. 'Flood' = level at/above "
+                     f"{TRAIN_RISK_THRESHOLD_M} m (0.80 quantile). Horizons extrapolate the recent trend.")
 
 # ---- Header ----
 h1, h2 = st.columns([2.2, 1])
@@ -296,27 +328,44 @@ with right:
                     f"<b>{blo*100:.0f}% – {bhi*100:.0f}%</b></div>{band_bar(blo, bhi, prob)}",
                     unsafe_allow_html=True)
 
-    # Card 2 — explainability
+    # Card 2 — explainability (adapts to the selected model)
     with st.container(border=True):
-        st.markdown("<div class='card-title'>Why this score</div>"
-                    "<div class='muted'>per-feature contribution (exact for logistic regression)</div>",
-                    unsafe_allow_html=True)
-        contrib = pd.DataFrame([{"feature": FEATURE_LABEL[f],
-                                 "contribution": round(coefs[f] * (feats[f] - baseline[f]), 3)}
-                                for f in FEATURES])
-        contrib["direction"] = contrib["contribution"].apply(
-            lambda v: "Increases risk" if v >= 0 else "Decreases risk")
-        bars = alt.Chart(contrib).mark_bar().encode(
-            x=alt.X("contribution:Q", title=None),
-            y=alt.Y("feature:N", sort="-x", title=None),
-            color=alt.Color("direction:N",
-                            scale=alt.Scale(domain=["Increases risk", "Decreases risk"],
-                                            range=["#d64545", "#1f6feb"]),
-                            legend=alt.Legend(orient="bottom", title=None, labelFontSize=10)),
-            tooltip=[alt.Tooltip("feature:N"), alt.Tooltip("contribution:Q", format="+.3f")],
-        ).properties(height=132)
-        zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#c3ccd8").encode(x="x:Q")
-        st.altair_chart(zero + bars, use_container_width=True)
+        if hasattr(model, "coef_"):
+            coefs = coef_map(model)
+            st.markdown("<div class='card-title'>Why this score</div>"
+                        "<div class='muted'>per-feature contribution (exact for logistic regression)</div>",
+                        unsafe_allow_html=True)
+            contrib = pd.DataFrame([{"feature": FEATURE_LABEL[f],
+                                     "contribution": round(coefs[f] * (feats[f] - baseline[f]), 3)}
+                                    for f in FEATURES])
+            contrib["direction"] = contrib["contribution"].apply(
+                lambda v: "Increases risk" if v >= 0 else "Decreases risk")
+            bars = alt.Chart(contrib).mark_bar().encode(
+                x=alt.X("contribution:Q", title=None),
+                y=alt.Y("feature:N", sort="-x", title=None),
+                color=alt.Color("direction:N",
+                                scale=alt.Scale(domain=["Increases risk", "Decreases risk"],
+                                                range=["#d64545", "#1f6feb"]),
+                                legend=alt.Legend(orient="bottom", title=None, labelFontSize=10)),
+                tooltip=[alt.Tooltip("feature:N"), alt.Tooltip("contribution:Q", format="+.3f")],
+            ).properties(height=132)
+            zero = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#c3ccd8").encode(x="x:Q")
+            st.altair_chart(zero + bars, use_container_width=True)
+        elif hasattr(model, "feature_importances_"):
+            st.markdown("<div class='card-title'>Why this score</div>"
+                        "<div class='muted'>feature importance (Random Forest — magnitude only, not signed)</div>",
+                        unsafe_allow_html=True)
+            importances = pd.DataFrame([{"feature": FEATURE_LABEL[f],
+                                         "importance": round(float(model.feature_importances_[i]), 3)}
+                                        for i, f in enumerate(FEATURES)])
+            bars = alt.Chart(importances).mark_bar(color="#1f6feb").encode(
+                x=alt.X("importance:Q", title=None),
+                y=alt.Y("feature:N", sort="-x", title=None),
+                tooltip=[alt.Tooltip("feature:N"), alt.Tooltip("importance:Q", format=".3f")],
+            ).properties(height=132)
+            st.altair_chart(bars, use_container_width=True)
+        else:
+            st.caption("No explainability view available for this model.")
 
     # Card 3 — alert authorisation
     with st.container(border=True):
